@@ -37,6 +37,102 @@ static void *xmalloc(size_t size)
 static WCHAR *wusername, *password, *protocol, *host, *path, target[1024],
 	*password_expiry_utc;
 
+static int protect_credential_blob_as_user(LPWSTR blob, DWORD blob_length, LPWSTR *out, DWORD *out_length)
+{
+	if (!blob || !blob_length || !out || !out_length)
+		return 0;
+
+	DWORD error = ERROR_SUCCESS;
+	*out_length = 0;
+
+	CRED_PROTECTION_TYPE protection_type;
+	BOOL result = CredProtectW(TRUE, blob, blob_length, NULL, out_length, &protection_type);
+
+	error = GetLastError();
+	if (ERROR_SUCCESS != error) {
+		/* expected */
+		if (ERROR_INSUFFICIENT_BUFFER == error)
+			SetLastError(ERROR_SUCCESS);
+		else
+			return 0;
+	}
+
+	/* it should return false */
+	if (FALSE != result)
+		return 0;
+
+	*out = (LPWSTR)xmalloc((*out_length) * sizeof(wchar_t));
+	result = CredProtectW(TRUE, blob, blob_length, *out, out_length, &protection_type);
+
+	if (TRUE != result)
+		return 0;
+
+	if (protection_type != CredUserProtection)
+		return 0;
+
+	return 1;
+}
+
+static int is_protected_credential_blob_as_user(LPCWSTR blob)
+{
+	if (!blob)
+		return 0;
+
+	CRED_PROTECTION_TYPE protection_type;
+	BOOL result = CredIsProtectedW((LPWSTR)blob, &protection_type);
+
+	/*
+	 * if this API fails, it may lead to logic issues
+	 * so we don't reset GetLastError
+	 */
+	if (ERROR_SUCCESS != GetLastError()) {
+		return 0;
+	}
+
+	if (TRUE != result) {
+		return 0;
+	}
+
+	if (protection_type != CredUserProtection) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/* assumes blob is protected, you must check by is_protected_credential_blob_as_user */
+static int unprotect_credential_blob_as_user(LPCWSTR blob, DWORD blob_length, LPWSTR *out, DWORD *out_length)
+{
+	if (!blob || !blob_length || !out || !out_length)
+		return 0;
+
+	DWORD error = ERROR_SUCCESS;
+	*out_length = 0;
+
+	BOOL result = CredUnprotectW(TRUE, (LPWSTR)blob, blob_length, NULL, out_length);
+
+	error = GetLastError();
+	if (ERROR_SUCCESS != error) {
+		/* expected */
+		if (ERROR_INSUFFICIENT_BUFFER == error)
+			SetLastError(ERROR_SUCCESS);
+		else
+			return 0;
+	}
+
+	/* it should return false */
+	if (FALSE != result)
+		return 0;
+
+	*out = (LPWSTR)xmalloc((*out_length) * sizeof(wchar_t));
+	result = CredUnprotectW(TRUE, (LPWSTR)blob, blob_length, *out, out_length);
+
+	if (TRUE != result)
+		return 0;
+
+	return 1;
+}
+
 static void write_item(const char *what, LPCWSTR wbuf, int wlen)
 {
 	char *buf;
@@ -140,6 +236,11 @@ static void get_credential(void)
 	DWORD num_creds;
 	int i;
 	CREDENTIAL_ATTRIBUTEW *attr;
+	LPWSTR out;
+	DWORD out_length;
+	LPCWSTR used_password;
+
+	out = NULL;
 
 	if (!CredEnumerateW(L"git:*", 0, &num_creds, &creds))
 		return;
@@ -147,11 +248,19 @@ static void get_credential(void)
 	/* search for the first credential that matches username */
 	for (i = 0; i < num_creds; ++i)
 		if (match_cred(creds[i], 0)) {
+			used_password = (LPCWSTR)creds[i]->CredentialBlob;
+			if (is_protected_credential_blob_as_user(used_password)) {
+				if (unprotect_credential_blob_as_user(used_password,
+					creds[i]->CredentialBlobSize / sizeof(wchar_t), &out, &out_length)) {
+						used_password = (LPCWSTR)out;
+					}
+			}
+
 			write_item("username", creds[i]->UserName,
 				creds[i]->UserName ? wcslen(creds[i]->UserName) : 0);
 			write_item("password",
-				(LPCWSTR)creds[i]->CredentialBlob,
-				creds[i]->CredentialBlobSize / sizeof(WCHAR));
+				used_password,
+				used_password ? wcslen(used_password) : 0);
 			for (int j = 0; j < creds[i]->AttributeCount; j++) {
 				attr = creds[i]->Attributes + j;
 				if (!wcscmp(attr->Keyword, L"git_password_expiry_utc")) {
@@ -164,22 +273,37 @@ static void get_credential(void)
 		}
 
 	CredFree(creds);
+	if (out)
+		free(out);
 }
+
 
 static void store_credential(void)
 {
 	CREDENTIALW cred;
 	CREDENTIAL_ATTRIBUTEW expiry_attr;
+	LPWSTR out;
+	DWORD out_length;
+	LPWSTR blob;
+	DWORD blob_size;
 
 	if (!wusername || !password)
 		return;
+
+	blob = password;
+	blob_size = wcslen(password) * 2;
+	int result = protect_credential_blob_as_user(password, blob_size, &out, &out_length);
+	if (result) {
+		blob = out;
+		blob_size = out_length * 2;
+	}
 
 	cred.Flags = 0;
 	cred.Type = CRED_TYPE_GENERIC;
 	cred.TargetName = target;
 	cred.Comment = L"saved by git-credential-wincred";
-	cred.CredentialBlobSize = (wcslen(password)) * sizeof(WCHAR);
-	cred.CredentialBlob = (LPVOID)password;
+	cred.CredentialBlobSize = blob_size;
+	cred.CredentialBlob = (LPVOID)blob;
 	cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
 	cred.AttributeCount = 0;
 	cred.Attributes = NULL;
